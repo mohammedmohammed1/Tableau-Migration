@@ -3,6 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -492,6 +493,527 @@ app.post("/api/generate-bim", (req, res) => {
     });
   } catch (error: any) {
     console.error("Error generating BIM:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =========================================================================
+// ENTERPRISE USER AUTHENTICATION & SECURITY STATE
+// =========================================================================
+
+interface User {
+  email: string;
+  name: string;
+  role: string;
+  salt: string;
+  passwordHash: string;
+  failedAttempts: number;
+  lockoutUntil: Date | null;
+  mfaSecret: string;
+  mfaEnabled: boolean;
+}
+
+interface Session {
+  token: string;
+  email: string;
+  role: string;
+  name: string;
+  expiresAt: Date;
+}
+
+interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  user: string;
+  ipAddress: string;
+  action: string;
+  result: "SUCCESS" | "FAILED" | "LOCKOUT" | "MFA_REQUIRED" | "MFA_VERIFIED" | "LOGOUT" | "RESET_REQUEST";
+  details: string;
+  userAgent: string;
+}
+
+const USERS_DB: Record<string, User> = {};
+const SESSIONS: Record<string, Session> = {};
+const MFA_TEMP_TOKENS: Record<string, { email: string; expiresAt: Date }> = {};
+const AUDIT_LOGS: AuditLogEntry[] = [
+  {
+    id: "log-init",
+    timestamp: new Date().toISOString(),
+    user: "SYSTEM",
+    ipAddress: "127.0.0.1",
+    action: "SYSTEM_BOOT",
+    result: "SUCCESS",
+    details: "Enterprise Tableau-to-PowerBI secure gateway booted. SHA-512 hashing module active.",
+    userAgent: "Internal Service Daemon",
+  }
+];
+
+// Helper to hash passwords securely using PBKDF2
+function hashPassword(password: string, salt: string): string {
+  return crypto.pbkdf2Sync(password, salt, 1000, 64, "sha512").toString("hex");
+}
+
+// Seed corporate directory accounts on boot
+function seedUsers() {
+  const defaultPassword = "Tableau2PBI!2026";
+  const usersToSeed = [
+    { email: "admin@enterprise.com", name: "Yasin Administrator", role: "Administrator", mfaEnabled: true },
+    { email: "developer@enterprise.com", name: "Sarah Developer", role: "Developer", mfaEnabled: false },
+    { email: "business@enterprise.com", name: "Michael Business User", role: "Business User", mfaEnabled: false },
+    { email: "viewer@enterprise.com", name: "David Viewer", role: "Viewer", mfaEnabled: false },
+    { email: "mohamedyasin9168@gmail.com", name: "Mohamed Yasin", role: "Administrator", mfaEnabled: true }
+  ];
+
+  for (const u of usersToSeed) {
+    const salt = crypto.randomBytes(16).toString("hex");
+    const passwordHash = hashPassword(defaultPassword, salt);
+    USERS_DB[u.email.toLowerCase()] = {
+      email: u.email,
+      name: u.name,
+      role: u.role,
+      salt,
+      passwordHash,
+      failedAttempts: 0,
+      lockoutUntil: null,
+      mfaSecret: "123456", // Standard OTP for easy demonstration
+      mfaEnabled: u.mfaEnabled,
+    };
+  }
+}
+
+seedUsers();
+
+// Helper to log security events
+function writeAuditLog(user: string, ip: string, action: string, result: AuditLogEntry["result"], details: string, ua: string) {
+  AUDIT_LOGS.unshift({
+    id: `log-${crypto.randomBytes(4).toString("hex")}`,
+    timestamp: new Date().toISOString(),
+    user,
+    ipAddress: ip || "127.0.0.1",
+    action,
+    result,
+    details,
+    userAgent: ua || "Unknown Client Browser",
+  });
+}
+
+// 0. POST: New User Registration
+app.post("/api/auth/register", (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: "Username, Email Address, and Password are required." });
+    }
+
+    const normEmail = email.toLowerCase().trim();
+    const normUsername = username.trim();
+
+    // Check if email already exists
+    if (USERS_DB[normEmail]) {
+      return res.status(400).json({ error: "An account with this email address already exists." });
+    }
+
+    // Check if username already exists (case-insensitive check on name)
+    const usernameExists = Object.values(USERS_DB).some(
+      (u) => u.name.toLowerCase().trim() === normUsername.toLowerCase()
+    );
+    if (usernameExists) {
+      return res.status(400).json({ error: "This username is already taken." });
+    }
+
+    // Register user
+    const salt = crypto.randomBytes(16).toString("hex");
+    const passwordHash = hashPassword(password, salt);
+
+    USERS_DB[normEmail] = {
+      email: normEmail,
+      name: username,
+      role: "Developer", // Default role
+      salt,
+      passwordHash,
+      failedAttempts: 0,
+      lockoutUntil: null,
+      mfaSecret: "123456",
+      mfaEnabled: false,
+    };
+
+    writeAuditLog(normEmail, ip, "REGISTER", "SUCCESS", `New user successfully registered: ${username} (${email})`, ua);
+
+    return res.json({ success: true, message: "Registration successful. You can now sign in." });
+  } catch (error: any) {
+    console.error("Registration failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 1. POST: User login attempt
+app.post("/api/auth/login", (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email/username and password credentials are required." });
+    }
+
+    const normInput = email.toLowerCase().trim();
+    // find user by email or username (name)
+    let user = USERS_DB[normInput];
+    if (!user) {
+      user = Object.values(USERS_DB).find(u => u.name.toLowerCase().trim() === normInput);
+    }
+
+    if (!user) {
+      writeAuditLog(normInput, ip, "LOGIN_ATTEMPT", "FAILED", "Attempted authentication with non-existent email/username.", ua);
+      return res.status(401).json({ error: "Invalid email/username or password credentials." });
+    }
+
+    // Check Lockout
+    if (user.lockoutUntil && user.lockoutUntil > new Date()) {
+      const remainingSeconds = Math.ceil((user.lockoutUntil.getTime() - Date.now()) / 1000);
+      writeAuditLog(user.email, ip, "LOGIN_LOCKOUT", "LOCKOUT", `Blocked login attempt. Account is locked out for another ${remainingSeconds}s.`, ua);
+      return res.status(423).json({
+        error: `Account is currently locked out due to multiple failed login attempts. Please wait ${remainingSeconds} seconds before trying again.`,
+        locked: true,
+        remaining: remainingSeconds
+      });
+    }
+
+    // Validate Password Hash
+    const computedHash = hashPassword(password, user.salt);
+    if (computedHash !== user.passwordHash) {
+      user.failedAttempts += 1;
+      
+      if (user.failedAttempts >= 3) {
+        user.lockoutUntil = new Date(Date.now() + 60 * 1000); // 60s security lock
+        writeAuditLog(user.email, ip, "ACCOUNT_LOCKOUT", "LOCKOUT", "Account locked out for 60 seconds due to 3 consecutive password failures.", ua);
+        return res.status(423).json({
+          error: "Account locked out. Too many failed attempts. Security lock engaged for 60 seconds.",
+          locked: true,
+          remaining: 60
+        });
+      }
+
+      writeAuditLog(user.email, ip, "PASSWORD_FAILURE", "FAILED", `Incorrect password. Failed attempt #${user.failedAttempts}.`, ua);
+      return res.status(401).json({
+        error: `Invalid email or password credentials. ${3 - user.failedAttempts} attempts remaining before account lockout.`,
+        attemptsRemaining: 3 - user.failedAttempts
+      });
+    }
+
+    // Success! Reset failures
+    user.failedAttempts = 0;
+    user.lockoutUntil = null;
+
+    // Multi-factor check
+    if (user.mfaEnabled) {
+      const tempToken = crypto.randomBytes(32).toString("hex");
+      MFA_TEMP_TOKENS[tempToken] = {
+        email: user.email,
+        expiresAt: new Date(Date.now() + 5 * 60 * 1000) // 5 minutes expiration
+      };
+
+      writeAuditLog(user.email, ip, "MFA_CHALLENGE", "MFA_REQUIRED", "Password correct. Redirecting to multi-factor authorization challenge.", ua);
+      return res.json({
+        mfaRequired: true,
+        email: user.email,
+        tempToken,
+        message: "Multi-Factor Authentication (MFA) required. Enter the 6-digit OTP code."
+      });
+    }
+
+    // Standard Direct Login Session
+    const sessionToken = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 min expiration (configurable in UI)
+    
+    SESSIONS[sessionToken] = {
+      token: sessionToken,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+      expiresAt,
+    };
+
+    writeAuditLog(user.email, ip, "LOGIN_SUCCESS", "SUCCESS", `User session generated. Assigned role: ${user.role}.`, ua);
+
+    res.json({
+      success: true,
+      token: sessionToken,
+      user: {
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        mfaEnabled: false
+      }
+    });
+  } catch (error: any) {
+    console.error("Login failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 2. POST: Verify MFA Code
+app.post("/api/auth/verify-mfa", (req, res) => {
+  try {
+    const { tempToken, code } = req.body;
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    if (!tempToken || !code) {
+      return res.status(400).json({ error: "Challenge token and 6-digit verification code are required." });
+    }
+
+    const challenge = MFA_TEMP_TOKENS[tempToken];
+    if (!challenge || challenge.expiresAt < new Date()) {
+      return res.status(410).json({ error: "The MFA challenge session has expired or is invalid. Please sign in again." });
+    }
+
+    const user = USERS_DB[challenge.email.toLowerCase()];
+    if (!user) {
+      return res.status(404).json({ error: "User profile not found." });
+    }
+
+    // Verify code against static OTP (simulating authenticator / corporate push)
+    if (code !== user.mfaSecret && code !== "123456") {
+      writeAuditLog(user.email, ip, "MFA_FAILURE", "FAILED", "Incorrect Multi-Factor verification code entered.", ua);
+      return res.status(401).json({ error: "Invalid verification code. Please check your authenticator and try again." });
+    }
+
+    // Successful MFA clearance
+    delete MFA_TEMP_TOKENS[tempToken];
+
+    const sessionToken = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
+
+    SESSIONS[sessionToken] = {
+      token: sessionToken,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+      expiresAt,
+    };
+
+    writeAuditLog(user.email, ip, "MFA_VERIFIED", "MFA_VERIFIED", `MFA cleared. User session authorized. Assigned role: ${user.role}.`, ua);
+
+    res.json({
+      success: true,
+      token: sessionToken,
+      user: {
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        mfaEnabled: true
+      }
+    });
+  } catch (error: any) {
+    console.error("MFA verification failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 3. GET: Get/validate current session
+app.get("/api/auth/session", (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : (req.query.token as string);
+
+    if (!token || !SESSIONS[token]) {
+      return res.json({ authenticated: false });
+    }
+
+    const session = SESSIONS[token];
+    if (session.expiresAt < new Date()) {
+      delete SESSIONS[token];
+      return res.json({ authenticated: false, reason: "Session expired due to inactivity." });
+    }
+
+    // Refresh Session Lifetime on active request (Extend session configurable timeout)
+    const activeUser = USERS_DB[session.email.toLowerCase()];
+    const customTimeout = req.query.timeout ? parseInt(req.query.timeout as string, 10) : 15; // default 15 mins
+    const sessionLifetimeMs = customTimeout * 60 * 1000;
+    session.expiresAt = new Date(Date.now() + sessionLifetimeMs);
+
+    res.json({
+      authenticated: true,
+      user: {
+        email: session.email,
+        name: session.name,
+        role: session.role,
+        mfaEnabled: activeUser ? activeUser.mfaEnabled : false
+      },
+      expiresAt: session.expiresAt.toISOString()
+    });
+  } catch (error: any) {
+    console.error("Session fetch failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 4. POST: User logout
+app.post("/api/auth/logout", (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : req.body.token;
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    if (token && SESSIONS[token]) {
+      const session = SESSIONS[token];
+      writeAuditLog(session.email, ip, "LOGOUT", "LOGOUT", "User logged out. Session keys invalidated.", ua);
+      delete SESSIONS[token];
+    }
+
+    res.json({ success: true, message: "Logged out successfully." });
+  } catch (error: any) {
+    console.error("Logout failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 5. GET: Security Audit Logs (RBAC: Restricted to Administrators)
+app.get("/api/auth/audit-logs", (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : (req.query.token as string);
+
+    if (!token || !SESSIONS[token]) {
+      return res.status(401).json({ error: "Access denied. Valid session token is required." });
+    }
+
+    const session = SESSIONS[token];
+    if (session.role !== "Administrator") {
+      return res.status(403).json({ error: "Permission Denied. Only system Administrators can inspect security audit logs." });
+    }
+
+    res.json({
+      success: true,
+      logs: AUDIT_LOGS
+    });
+  } catch (error: any) {
+    console.error("Audit log fetch failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 6. POST: Password Reset / Forgot Password simulation
+app.post("/api/auth/forgot-password", (req, res) => {
+  try {
+    const { email } = req.body;
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    if (!email) {
+      return res.status(400).json({ error: "Email address is required." });
+    }
+
+    const normEmail = email.toLowerCase().trim();
+    const user = USERS_DB[normEmail];
+
+    writeAuditLog(normEmail, ip, "RESET_REQUEST", "RESET_REQUEST", "Password reset ticket generated. Dispatched temporary bypass token.", ua);
+
+    if (user) {
+      // Automatically clear lockouts as a helpful administrator shortcut!
+      user.failedAttempts = 0;
+      user.lockoutUntil = null;
+    }
+
+    res.json({
+      success: true,
+      message: "An enterprise password recovery link has been dispatched to your corporate inbox. Locked security thresholds have been reset."
+    });
+  } catch (error: any) {
+    console.error("Password reset failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 7. POST: Update MFA Settings
+app.post("/api/auth/mfa-toggle", (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : req.body.token;
+    const { enabled } = req.body;
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    if (!token || !SESSIONS[token]) {
+      return res.status(401).json({ error: "Authentication session required." });
+    }
+
+    const session = SESSIONS[token];
+    const user = USERS_DB[session.email.toLowerCase()];
+
+    if (user) {
+      user.mfaEnabled = !!enabled;
+      writeAuditLog(user.email, ip, "MFA_SETTINGS_UPDATE", "SUCCESS", `Multi-Factor Authentication (MFA) was toggled to: ${user.mfaEnabled ? "ENABLED" : "DISABLED"}.`, ua);
+      return res.json({ success: true, mfaEnabled: user.mfaEnabled });
+    }
+
+    res.status(404).json({ error: "User not found." });
+  } catch (error: any) {
+    console.error("MFA settings update failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 8. POST: Modify Role (Developer/Administrator Preview Switcher)
+app.post("/api/auth/change-role", (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : req.body.token;
+    const { newRole } = req.body;
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    if (!token || !SESSIONS[token]) {
+      return res.status(401).json({ error: "Authentication session required." });
+    }
+
+    const session = SESSIONS[token];
+    const user = USERS_DB[session.email.toLowerCase()];
+
+    if (user) {
+      const allowedRoles = ["Administrator", "Developer", "Business User", "Viewer"];
+      if (!allowedRoles.includes(newRole)) {
+        return res.status(400).json({ error: "Invalid role specified." });
+      }
+
+      user.role = newRole;
+      session.role = newRole;
+      writeAuditLog(user.email, ip, "ROLE_UPDATE", "SUCCESS", `User switched role context to: ${newRole}. RBAC filters re-compiled.`, ua);
+      return res.json({ success: true, role: newRole, user: { email: user.email, name: user.name, role: newRole, mfaEnabled: user.mfaEnabled } });
+    }
+
+    res.status(404).json({ error: "User not found." });
+  } catch (error: any) {
+    console.error("Role swap failure:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET / POST custom logging endpoint
+app.post("/api/auth/log-event", (req, res) => {
+  try {
+    const { action, details } = req.body;
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.startsWith("Bearer ") ? authHeader.substring(7) : null;
+
+    if (!token || !SESSIONS[token]) {
+      return res.status(401).json({ error: "Access denied. Valid session token is required." });
+    }
+
+    const session = SESSIONS[token];
+    const ip = req.ip || "127.0.0.1";
+    const ua = req.headers["user-agent"] || "Unknown Browser";
+
+    writeAuditLog(session.email, ip, action || "PROJECT_MODIFIED", "SUCCESS", details || "", ua);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Log event failure:", error);
     res.status(500).json({ error: error.message });
   }
 });

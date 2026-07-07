@@ -101,6 +101,7 @@ export interface ValidationSummary {
 export interface MigrationProject {
   id: string;
   name: string;
+  owner?: string;
   status: "Pending" | "Analyzing" | "Extracted" | "Converting" | "Validated" | "Completed" | "Failed";
   progress: number;
   tableauFileName: string;
@@ -121,3 +122,28 @@ export interface AuditLog {
   status: "Success" | "Warning" | "Failure";
   details: string;
 }
+
+export type UserRole = "Administrator" | "Developer" | "Business User" | "Viewer";
+
+export interface UserSession {
+  email: string;
+  name: string;
+  role: UserRole;
+  profilePic?: string;
+  authenticatedAt: string;
+  mfaEnabled: boolean;
+  mfaVerified: boolean;
+  lockoutRemainingSeconds?: number;
+}
+
+export interface LoginAuditLog {
+  id: string;
+  timestamp: string;
+  user: string;
+  ipAddress: string;
+  action: string;
+  result: "SUCCESS" | "FAILED" | "LOCKOUT" | "MFA_REQUIRED";
+  details: string;
+  userAgent: string;
+}
+

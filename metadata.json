@@ -1,5 +1,5 @@
 {
-  "name": "Tableau to Power BI Migration Platform",
+  "name": "Tableau to Power BI Migration",
   "description": "Enterprise-grade migration platform that analyzes Tableau Workbooks (.twb/.twbx), extracts metadata, maps data models, converts calculations into DAX, generates Power Query (M), and builds Power BI semantic models.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
